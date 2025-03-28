@@ -1,9 +1,9 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
 
 namespace Butler.OnePasswordExtensions;
 
@@ -24,7 +24,7 @@ public static class SecretsLoader
         _vaultIdKey = vaultIdKey;
     }
 
-    public static async Task LoadSecrets(IConfigurationManager configurationManager, string filterTag, ILogger logger)
+    public static async Task LoadSecrets(IConfigurationManager configurationManager, string filterTag, string sectionName, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(configurationManager, nameof(configurationManager));
         ArgumentNullException.ThrowIfNull(filterTag, nameof(filterTag));
@@ -38,8 +38,8 @@ public static class SecretsLoader
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(vaultId))
         {
             var errorMessage = "Secrets are not configured correctly. Please check your configuration.";
-
-            logger?.LogError(errorMessage);
+             
+            logger.LogError(errorMessage);
             throw new OnePasswordSetupException(errorMessage);
         }
 
@@ -65,7 +65,7 @@ public static class SecretsLoader
             // Add all retrieved secrets to the configuration
             foreach (var item in fullItems)
             {
-                var secretsDictionary = GetSecretDictionaryFromFields(item, logger);
+                var secretsDictionary = GetSecretDictionaryFromFields(item,sectionName, logger);
                 
                 foreach (var kvp in secretsDictionary)
                 {
@@ -89,8 +89,8 @@ public static class SecretsLoader
     private static async Task<IEnumerable<ItemDetail>> GetVaultItemsAsync(HttpClient httpClient, string vaultId, string filterTag, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient, nameof(httpClient));
-        ArgumentNullException.ThrowIfNullOrWhiteSpace(vaultId, nameof(vaultId));
-        ArgumentNullException.ThrowIfNullOrWhiteSpace(filterTag, nameof(filterTag));
+        ArgumentException.ThrowIfNullOrWhiteSpace(vaultId, nameof(vaultId));
+        ArgumentException.ThrowIfNullOrWhiteSpace(filterTag, nameof(filterTag));
 
         var itemListUrl = $"/v1/vaults/{vaultId}/items?tags={filterTag}";
         var response = await httpClient.GetAsync(itemListUrl);
@@ -107,7 +107,7 @@ public static class SecretsLoader
     private static async Task<ItemDetail?> GetItemDetailsAsync(HttpClient httpClient, string itemId, Func<ItemDetail, bool>? filter, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient, nameof(httpClient));
-        ArgumentNullException.ThrowIfNullOrWhiteSpace(itemId, nameof(itemId));
+        ArgumentException.ThrowIfNullOrWhiteSpace(itemId, nameof(itemId));
 
         var itemDetailUrl = $"/v1/items/{itemId}";
         var response = await httpClient.GetAsync(itemDetailUrl);
@@ -134,12 +134,17 @@ public static class SecretsLoader
         return itemDetail;
     }
 
-    private static Dictionary<string, string> GetSecretDictionaryFromFields(ItemDetail item, ILogger logger)
+    private static Dictionary<string, string> GetSecretDictionaryFromFields(ItemDetail item, string sectionName, ILogger logger)
     {
-        ArgumentNullException.ThrowIfNull(item, nameof(item));
-        
-        var secretDictionary = new Dictionary<string, string>();
+        ArgumentNullException.ThrowIfNull(item, nameof(item));        
 
+        var secretDictionary = new Dictionary<string, string>();        
+
+        if(SectionNameIsNotEmpty(sectionName) && NotExistsSectionNameInItem(item, sectionName))
+        {
+            return secretDictionary;    
+        }        
+        
         if(item.Fields == null || item.Fields.Length == 0)
         {
             var errorMessage = $"Item with id {item.Id} does not have any fields";
@@ -150,20 +155,64 @@ public static class SecretsLoader
 
         foreach (var field in item.Fields)
         {
-            if (field.Type == "T" || field.Type == "P")
-            {
-                secretDictionary[field.Label] = field.Value;
-            }
-            else if (field.Type == "A")
-            {
-                var section = field.Section;
-                if (section != null)
-                {
-                    secretDictionary[section.Label] = field.Value;
-                }
-            }
+            var key = $"{item.Title}:{field.Label}";
+            var value = field.Value;
+
+            if(string.IsNullOrWhiteSpace(key))
+                continue;            
+
+            secretDictionary.Add(key, value);
         }
 
         return secretDictionary;
+
+        #region Local Methods
+        bool SectionNameIsNotEmpty(string sectionName)
+        {
+            return string.IsNullOrWhiteSpace(sectionName) == false;
+        }
+
+        bool NotExistsSectionNameInItem(ItemDetail item, string sectionName)
+        {
+            return item.Sections.Any(section => section.Label == sectionName);
+        } 
+        #endregion
+    }
+
+    private static void SetJsonConfiguration(IConfigurationBuilder configuration, string jsonMarkdownString, ILogger? logger)
+    {
+        ArgumentNullException.ThrowIfNull(configuration, nameof(configuration));
+        ArgumentException.ThrowIfNullOrWhiteSpace(jsonMarkdownString, nameof(jsonMarkdownString));
+
+        if(IsNotJsonMarkdownString(jsonMarkdownString))
+        {
+            logger?.LogWarning($"the parameter '{nameof(jsonMarkdownString)}' is not Json Markdown");
+            return;
+        }
+
+        try
+        {
+            string jsonString = jsonMarkdownString.Substring(7, jsonMarkdownString.Length - 10).Trim();
+
+            using (var jsonObject = JsonDocument.Parse(jsonString))
+            using (var jsonStream = new MemoryStream(Encoding.UTF8.GetBytes(jsonString)))
+            {
+                jsonStream.Position = 0;
+                configuration.AddJsonStream(jsonStream);
+            }
+        }
+        catch (Exception ex)
+        {
+            var errorMessage = "Failed to parse JSON configuration string";
+            logger?.LogError(errorMessage);
+            throw new OnePasswordSetupException(errorMessage, ex);
+        }
+
+        #region Local Methods
+        bool IsNotJsonMarkdownString(string targetString)
+        {
+            return (targetString.StartsWith("```json") && targetString.EndsWith("```")) == false;
+        } 
+        #endregion
     }
 }
