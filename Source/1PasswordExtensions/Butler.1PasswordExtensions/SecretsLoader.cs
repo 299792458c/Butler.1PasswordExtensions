@@ -39,7 +39,7 @@ public static class SecretsLoader
         {
             var errorMessage = "Secrets are not configured correctly. Please check your configuration.";
 
-            logger.LogError(errorMessage);
+            logger?.LogError(errorMessage);
             throw new OnePasswordSetupException(errorMessage);
         }
 
