@@ -19,6 +19,6 @@ public class Worker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         Console.WriteLine("Worker running");
-        Console.WriteLine(_options.DefaultConnection);
+        Console.WriteLine(_configuration.GetConnectionString("DefaultConnection"));
     }
 }

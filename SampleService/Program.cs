@@ -10,7 +10,7 @@ var loggerFactory = builder.Services.BuildServiceProvider().GetRequiredService<I
 var logger = loggerFactory.CreateLogger("Startup");
 
 // 로컬 개발환경을 기본적으로 디버거가 연결되어 있다고 가정
-if (Debugger.IsAttached || builder.Environment.IsDevelopment())
+if (Debugger.IsAttached)
 {
     // 로컬 개발환경에서 UserSecrets를 로드
     await LoadUserSecretsAsync(builder.Configuration);
