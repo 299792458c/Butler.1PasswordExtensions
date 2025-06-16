@@ -24,10 +24,10 @@ public static class SecretsLoader
         _vaultIdKey = vaultIdKey;
     }
 
-    public static async Task LoadSecrets(IConfigurationManager configurationManager, string filterTag, string sectionName, ILogger logger)
+    public static async Task LoadSecretsAsync(IConfigurationManager configurationManager, string filterTag, string sectionName, ILogger? logger, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(configurationManager, nameof(configurationManager));
-        ArgumentNullException.ThrowIfNull(filterTag, nameof(filterTag));
+        //ArgumentNullException.ThrowIfNull(filterTag, nameof(filterTag));
 
         logger ??= NullLogger.Instance;
 
@@ -37,9 +37,9 @@ public static class SecretsLoader
 
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(vaultId))
         {
-            var errorMessage = "Secrets are not configured correctly. Please check your configuration.";
+            const string errorMessage = "Secrets are not configured correctly. Please check your configuration.";
 
-            logger?.LogError(errorMessage);
+            logger.LogError(errorMessage);
             throw new OnePasswordSetupException(errorMessage);
         }
 
@@ -48,32 +48,73 @@ public static class SecretsLoader
             httpClient.BaseAddress = new Uri(baseUrl);
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
             
+            // 이렇게 얻는 아이템은 상세 내역이 포함되어 있지 않음
             var items = await GetVaultItemsAsync(httpClient, vaultId, filterTag, logger);
-
+            // 상세 내역을 저장할 리스트
             var fullItems = new List<ItemDetail>();
 
             foreach (var item in items)
             {
-                var itemDetail = await GetItemDetailsAsync(httpClient, item.Id, null, logger);
+                var itemDetail = await GetItemDetailsAsync(httpClient, vaultId, item.Id, null, logger);
 
                 if(itemDetail != null)
                 {
                     fullItems.Add(itemDetail);
                 }
             }
-            
+
             // Add all retrieved secrets to the configuration
             foreach (var item in fullItems)
             {
-                var secretsDictionary = GetSecretDictionaryFromFields(item,sectionName, logger);
+                Console.WriteLine(item.Title);
+                
+                // 1. Process fields
+                var secretsDictionary = GetSecretDictionaryFromFields(item, sectionName, logger);
                 
                 foreach (var kvp in secretsDictionary)
                 {
                     configurationManager[kvp.Key] = kvp.Value;
                     logger.LogDebug("Added secret with key: {Key}", kvp.Key);
                 }
+
+                var itemNotes = item.Fields.SingleOrDefault(field => field.Purpose == "NOTES");
+
+                // 2. Process notes if available and in JSON markdown format
+                if (itemNotes != null && !string.IsNullOrWhiteSpace(itemNotes.Value))
+                {
+                    // Check if the notes are in JSON markdown format
+                    if (IsJsonMarkdownString(itemNotes.Value))
+                    {
+                        try
+                        {
+                            var newJsonConfigurationRoot  = SetJsonConfiguration(itemNotes.Value, logger);
+                            
+                            if(newJsonConfigurationRoot == null)
+                            {
+                                logger.LogWarning("Failed to parse JSON configuration from notes in item: {Title}", item.Title);
+                                continue;
+                            }
+                            
+                            configurationManager.AddConfiguration(newJsonConfigurationRoot);
+                            
+                            logger.LogDebug("Added JSON configuration from notes in item: {Title}", item.Title);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(ex, "Failed to process notes as JSON configuration in item: {Title}", item.Title);
+                        }
+                    }
+                }
             }
-            
+
+            // Build and add the JSON configuration from notes
+            //var jsonConfig = configBuilder.Build();
+
+            //foreach (var jsonSource in configBuilder.Sources)
+            //{
+            //    //configurationManager.AddJsonStream(jsonSource.Build())
+            //}
+
             logger.LogInformation("Successfully loaded {Count} secrets from 1Password vault", fullItems.Count);
         }
     }
@@ -85,31 +126,58 @@ public static class SecretsLoader
     /// <param name="vaultId"></param>
     /// <param name="filterTag"></param>
     /// <param name="logger"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    private static async Task<IEnumerable<ItemDetail>> GetVaultItemsAsync(HttpClient httpClient, string vaultId, string filterTag, ILogger logger)
+    private static async Task<IEnumerable<ItemDetail>> GetVaultItemsAsync(HttpClient httpClient, string vaultId, string filterTag, ILogger? logger, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(httpClient, nameof(httpClient));
         ArgumentException.ThrowIfNullOrWhiteSpace(vaultId, nameof(vaultId));
-        ArgumentException.ThrowIfNullOrWhiteSpace(filterTag, nameof(filterTag));
+        // ArgumentException.ThrowIfNullOrWhiteSpace(filterTag, nameof(filterTag));
+
+        if (string.IsNullOrWhiteSpace(filterTag))
+        {
+            filterTag = string.Empty;
+        }
 
         var itemListUrl = $"/v1/vaults/{vaultId}/items?tags={filterTag}";
-        var response = await httpClient.GetAsync(itemListUrl);
+        
+        try
+        {
+            var response = await httpClient.GetAsync(itemListUrl, cancellationToken);
+            response.EnsureSuccessStatusCode();
 
-        response.EnsureSuccessStatusCode();
+            var content = await response.Content.ReadAsStringAsync(cancellationToken);
+            var items = JsonSerializer.Deserialize<ItemDetail[]>(content);
 
-        var content = await response.Content.ReadAsStringAsync();
-        var items = JsonSerializer.Deserialize<ItemDetail[]>(content);
-
-        return items ?? Enumerable.Empty<ItemDetail>();
+            if (items == null || items.Length == 0)
+            {
+                logger?.LogWarning("No items found with tag {FilterTag} in vault {VaultId}", filterTag, vaultId);
+                return [];
+            }
+            
+            logger?.LogDebug("Found {Count} items with tag {FilterTag} in vault {VaultId}", items.Length, filterTag, vaultId);
+            return items;
+        }
+        catch (HttpRequestException ex)
+        {
+            var errorMessage = $"Failed to retrieve items with tag {filterTag} from vault {vaultId}";
+            logger?.LogError(ex, errorMessage);
+            throw new OnePasswordSetupException(errorMessage, ex);
+        }
+        catch (JsonException ex)
+        {
+            var errorMessage = $"Failed to deserialize response when retrieving items from vault {vaultId}";
+            logger?.LogError(ex, errorMessage);
+            throw new OnePasswordSetupException(errorMessage, ex);
+        }
     }
 
-
-    private static async Task<ItemDetail?> GetItemDetailsAsync(HttpClient httpClient, string itemId, Func<ItemDetail, bool>? filter, ILogger logger)
+    private static async Task<ItemDetail?> GetItemDetailsAsync(HttpClient httpClient, string vaultId, string itemId, Func<ItemDetail, bool>? filter, ILogger? logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient, nameof(httpClient));
         ArgumentException.ThrowIfNullOrWhiteSpace(itemId, nameof(itemId));
 
-        var itemDetailUrl = $"/v1/items/{itemId}";
+        var itemDetailUrl = $"/v1/vaults/{vaultId}/items/{itemId}";
         var response = await httpClient.GetAsync(itemDetailUrl);
 
         response.EnsureSuccessStatusCode();
@@ -134,22 +202,20 @@ public static class SecretsLoader
         return itemDetail;
     }
 
-    private static Dictionary<string, string> GetSecretDictionaryFromFields(ItemDetail item, string sectionName, ILogger logger)
+    private static Dictionary<string, string> GetSecretDictionaryFromFields(ItemDetail item, string sectionName, ILogger? logger)
     {
         ArgumentNullException.ThrowIfNull(item, nameof(item));        
 
         var secretDictionary = new Dictionary<string, string>();        
 
-        if(SectionNameIsNotEmpty(sectionName) && NotExistsSectionNameInItem(item, sectionName))
+        if(SectionNameIsNotEmpty(sectionName) && !ExistsSectionNameInItem(item, sectionName))
         {
             return secretDictionary;    
         }        
         
-        if(item.Fields == null || item.Fields.Length == 0)
+        if(NoFieldsInItem(item))
         {
-            var errorMessage = $"Item with id {item.Id} does not have any fields";
-
-            logger?.LogWarning(errorMessage);
+            logger?.LogWarning("Item with id {ItemId} does not have any fields", item.Id);
             return secretDictionary;
         }
 
@@ -172,33 +238,66 @@ public static class SecretsLoader
             return string.IsNullOrWhiteSpace(sectionName) == false;
         }
 
-        bool NotExistsSectionNameInItem(ItemDetail item, string sectionName)
+        bool ExistsSectionNameInItem(ItemDetail item, string sectionName)
         {
-            return item.Sections.Any(section => section.Label == sectionName);
+            try
+            {
+                // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+                if (item.Sections == null)
+                {
+                    return false;
+                }
+                
+                var existsMatchedSection = item.Sections.Any
+                (
+                    section =>
+                        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+                        section.Label != null &&
+                        section.Label.Equals(sectionName, StringComparison.CurrentCultureIgnoreCase)
+                );
+                return existsMatchedSection;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e);
+                throw;
+            }
+            
+            
         } 
+        
+        bool NoFieldsInItem(ItemDetail item)
+        {
+            return item.Fields.Length == 0;
+        }
+        
         #endregion
     }
 
-    private static void SetJsonConfiguration(IConfigurationBuilder configuration, string jsonMarkdownString, ILogger? logger)
+    private static IConfigurationRoot? SetJsonConfiguration(string jsonMarkdownString, ILogger? logger)
     {
-        ArgumentNullException.ThrowIfNull(configuration, nameof(configuration));
         ArgumentException.ThrowIfNullOrWhiteSpace(jsonMarkdownString, nameof(jsonMarkdownString));
-
-        if(IsNotJsonMarkdownString(jsonMarkdownString))
+        
+        IConfigurationBuilder configuration = new ConfigurationBuilder();
+        
+        if (IsJsonMarkdownString(jsonMarkdownString) == false)
         {
             logger?.LogWarning($"the parameter '{nameof(jsonMarkdownString)}' is not Json Markdown");
-            return;
+            return null;
         }
 
         try
         {
             string jsonString = jsonMarkdownString.Substring(7, jsonMarkdownString.Length - 10).Trim();
 
+            // ReSharper disable once ConvertToUsingDeclaration
             using (var jsonObject = JsonDocument.Parse(jsonString))
             using (var jsonStream = new MemoryStream(Encoding.UTF8.GetBytes(jsonString)))
             {
                 jsonStream.Position = 0;
                 configuration.AddJsonStream(jsonStream);
+
+                return configuration.Build();
             }
         }
         catch (Exception ex)
@@ -207,12 +306,10 @@ public static class SecretsLoader
             logger?.LogError(errorMessage);
             throw new OnePasswordSetupException(errorMessage, ex);
         }
+    }
 
-        #region Local Methods
-        bool IsNotJsonMarkdownString(string targetString)
-        {
-            return (targetString.StartsWith("```json") && targetString.EndsWith("```")) == false;
-        } 
-        #endregion
+    private static bool IsJsonMarkdownString(string targetString)
+    {
+        return (targetString.Trim().StartsWith("```json") && targetString.EndsWith("```"));
     }
 }
